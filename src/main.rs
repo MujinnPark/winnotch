@@ -569,6 +569,7 @@ mod ole_drag {
     };
     use windows::Win32::System::Ole::{IDropSource, IDropSource_Impl, DROPEFFECT};
     use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     /// Minimal drag source: drop when the left button is released, cancel on Esc.
     #[implement(IDropSource)]
@@ -606,57 +607,102 @@ mod ole_drag {
             }
         }
 
-        fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
+        fn GiveFeedback(&self, effect: DROPEFFECT) -> HRESULT {
+            // Log only when the target's answer changes. effect 0 = target refuses the
+            // drop, 1 = copy. If it never reaches 1 the target is rejecting our data.
+            if LAST_EFFECT.swap(effect.0 as i32, Ordering::Relaxed) != effect.0 as i32 {
+                super::drag_log(&format!("target effect -> {}", effect.0));
+            }
             DRAGDROP_S_USEDEFAULTCURSORS
+        }
+    }
+
+    pub fn reset_effect_log() {
+        LAST_EFFECT.store(-1, Ordering::Relaxed);
+    }
+
+    static LAST_EFFECT: AtomicI32 = AtomicI32::new(-1);
+}
+
+/// Builds the same data object Explorer hands out when you drag a file (CF_HDROP,
+/// Shell IDList Array, FileName...). Asked of the shell item itself, rather than
+/// `SHCreateDataObject` with a NULL parent folder, which produced an object Explorer
+/// refused to accept (DoDragDrop finished with effect 0 = DROPEFFECT_NONE).
+#[cfg(windows)]
+unsafe fn shell_data_object(path: &Path) -> Option<windows::Win32::System::Com::IDataObject> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx, IDataObject};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        SHCreateDataObject, SHCreateItemFromParsingName, SHParseDisplayName, IShellItem,
+        BHID_DataObject,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Preferred: ask the IShellItem for its data object.
+    let item: windows::core::Result<IShellItem> =
+        SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>);
+    match item {
+        Ok(item) => {
+            let data: windows::core::Result<IDataObject> =
+                item.BindToHandler(None::<&IBindCtx>, &BHID_DataObject);
+            match data {
+                Ok(d) => return Some(d),
+                Err(e) => drag_log(&format!("BHID_DataObject failed: {e}")),
+            }
+        }
+        Err(e) => drag_log(&format!("SHCreateItemFromParsingName failed: {e}")),
+    }
+
+    // Fallback: the previous approach.
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    if let Err(e) = SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None)
+    {
+        drag_log(&format!("SHParseDisplayName failed: {e}"));
+        return None;
+    }
+    if pidl.is_null() {
+        drag_log("SHParseDisplayName gave a null pidl");
+        return None;
+    }
+    let data: windows::core::Result<IDataObject> =
+        SHCreateDataObject(None, Some(&[pidl as *const ITEMIDLIST]), None::<&IDataObject>);
+    CoTaskMemFree(Some(pidl as *const std::ffi::c_void));
+    match data {
+        Ok(d) => Some(d),
+        Err(e) => {
+            drag_log(&format!("SHCreateDataObject failed: {e}"));
+            None
         }
     }
 }
 
 #[cfg(windows)]
 fn start_file_drag(path: &Path) {
-    use std::os::windows::ffi::OsStrExt;
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx, IDataObject};
     use windows::Win32::System::Ole::{DoDragDrop, IDropSource, OleInitialize, DROPEFFECT, DROPEFFECT_COPY};
-    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::UI::Shell::{SHCreateDataObject, SHParseDisplayName};
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_LBUTTONUP};
 
     drag_log(&format!("drag start: {}", path.display()));
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
     unsafe {
         // Harmless if the window toolkit already initialised OLE on this thread.
         drag_log(&format!("OleInitialize -> {:?}", OleInitialize(None)));
+        ole_drag::reset_effect_log();
 
-        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-        if let Err(e) =
-            SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None)
-        {
-            drag_log(&format!("SHParseDisplayName failed: {e}"));
-            return;
+        if let Some(data) = shell_data_object(path) {
+            let src: IDropSource = ole_drag::DragSource.into();
+            let mut effect = DROPEFFECT(0);
+            // COPY only, so the drop pastes a copy and our stored file stays in the tray.
+            let hr = DoDragDrop(&data, &src, DROPEFFECT_COPY, &mut effect);
+            drag_log(&format!("DoDragDrop -> {:?}, effect {}", hr, effect.0));
         }
-        if pidl.is_null() {
-            drag_log("SHParseDisplayName gave a null pidl");
-            return;
-        }
-        let data: windows::core::Result<IDataObject> =
-            SHCreateDataObject(None, Some(&[pidl as *const ITEMIDLIST]), None::<&IDataObject>);
-        match data {
-            Ok(data) => {
-                let src: IDropSource = ole_drag::DragSource.into();
-                let mut effect = DROPEFFECT(0);
-                // COPY only, so the drop pastes a copy and our stored file stays in the tray.
-                let hr = DoDragDrop(&data, &src, DROPEFFECT_COPY, &mut effect);
-                drag_log(&format!("DoDragDrop -> {:?}, effect {}", hr, effect.0));
-            }
-            Err(e) => drag_log(&format!("SHCreateDataObject failed: {e}")),
-        }
-        CoTaskMemFree(Some(pidl as *const std::ffi::c_void));
         // The drag loop swallowed the mouse-up; tell our window the button was released.
         if let Ok(hwnd) = FindWindowW(PCWSTR::null(), w!("winnotch")) {
             let _ = PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), LPARAM(0));
