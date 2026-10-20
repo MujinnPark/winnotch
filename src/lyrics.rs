@@ -26,6 +26,30 @@ impl Lyrics {
         }
     }
 
+    /// Fractional line index for scrolling synced lyrics: an integer while a line is
+    /// being sung, easing to the next one over the last `LEAD_MS` before it starts
+    /// (so the new line is fully highlighted exactly at its timestamp). It depends only
+    /// on the playback position, so it adds no lag of its own. -1 = before the first line.
+    pub fn scroll_pos(&self, pos_ms: u64) -> f32 {
+        const LEAD_MS: u64 = 260;
+        if self.lines.is_empty() {
+            return -1.0;
+        }
+        let cur = self.lines.partition_point(|(t, _)| *t <= pos_ms) as isize - 1;
+        let Some((next_t, _)) = self.lines.get((cur + 1) as usize) else {
+            return cur as f32;
+        };
+        let next_t = *next_t;
+        let cur_t = if cur >= 0 { self.lines[cur as usize].0 } else { 0 };
+        let span = next_t.saturating_sub(cur_t).min(LEAD_MS).max(1);
+        let start = next_t - span;
+        if pos_ms <= start {
+            return cur as f32;
+        }
+        let f = ((pos_ms - start) as f32 / span as f32).clamp(0.0, 1.0);
+        cur as f32 + f * f * (3.0 - 2.0 * f)
+    }
+
     /// Text of line `idx`; empty (instrumental gap) lines show as a note.
     pub fn text_at(&self, idx: isize) -> Option<&str> {
         if idx < 0 {
@@ -190,6 +214,25 @@ mod tests {
         assert_eq!(url_encode("a b&c"), "a%20b%26c");
         assert_eq!(url_encode("é"), "%C3%A9");
         assert_eq!(url_encode("Az-_.~09"), "Az-_.~09");
+    }
+
+    #[test]
+    fn scroll_position_is_exact_at_timestamps() {
+        let l = Lyrics {
+            lines: vec![(1000, "a".into()), (5000, "b".into()), (5100, "c".into())],
+            synced: true,
+            instrumental: false,
+        };
+        assert_eq!(l.scroll_pos(0), -1.0);
+        assert_eq!(l.scroll_pos(739), -1.0);
+        assert_eq!(l.scroll_pos(870), -0.5); // halfway through the intro -> line 0 ease
+        assert_eq!(l.scroll_pos(1000), 0.0);
+        assert_eq!(l.scroll_pos(4000), 0.0);
+        assert_eq!(l.scroll_pos(5000), 1.0);
+        // lines only 100 ms apart: the ease shrinks to fit
+        assert_eq!(l.scroll_pos(5050), 1.5);
+        assert_eq!(l.scroll_pos(5100), 2.0);
+        assert_eq!(l.scroll_pos(99_000), 2.0);
     }
 
     #[test]

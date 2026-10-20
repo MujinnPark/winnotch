@@ -9,6 +9,7 @@ mod system;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,10 @@ use system::SysEvent;
 
 const COMPACT: Vec2 = Vec2::new(220.0, 34.0);
 const EXPANDED: Vec2 = Vec2::new(600.0, 188.0);
+/// Idle "cat" notch (shown only while no music is playing).
+const CAT: Vec2 = Vec2::new(76.0, 48.0);
+/// Transparent margin around the cat so its purple glow has room to spread.
+const GLOW_PAD: f32 = 10.0;
 const TOAST: Vec2 = Vec2::new(330.0, 46.0);
 const ORANGE: Color32 = Color32::from_rgb(255, 159, 10);
 const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
@@ -62,6 +67,10 @@ struct TrayItem {
     info: String,
     kind: Kind,
     tex: Option<TextureHandle>,
+    /// Our own copy of the file/folder (inside `tray_root()`); this is what gets dragged out.
+    stored: PathBuf,
+    /// 0 = still copying, 1 = copy ready, 2 = copy failed (falls back to the original).
+    state: Arc<AtomicU8>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -112,6 +121,7 @@ struct Notch {
     toast_t: f32,
     tray: Vec<TrayItem>,
     tray_page: usize,
+    tray_seq: u64,
     media: MediaHandle,
     art_tex: Option<TextureHandle>,
     art_id: u64,
@@ -127,10 +137,18 @@ struct Notch {
     /// Tab whose content is currently shown, and its 0..1 fade/slide-in progress.
     prev_tab: Tab,
     tab_fade: f32,
+    /// 0 = normal compact notch, 1 = idle cat face (only while no music is playing).
+    cat_t: f32,
+    /// `time` at which the cat last appeared (drives the eyes' fade-in).
+    cat_born: f32,
+    /// Transparent glow margin the OS window currently has (see GLOW_PAD).
+    win_pad: f32,
 }
 
 impl Notch {
     fn new() -> Self {
+        // The tray isn't persisted, so drop copies left over from a previous run.
+        let _ = std::fs::remove_dir_all(tray_root());
         Self {
             t: 0.0,
             tab: Tab::Nook,
@@ -149,6 +167,7 @@ impl Notch {
             toast_t: 0.0,
             tray: Vec::new(),
             tray_page: 0,
+            tray_seq: 0,
             media: MediaHandle::spawn(),
             art_tex: None,
             art_id: u64::MAX,
@@ -159,11 +178,15 @@ impl Notch {
             tab_w: 56.0,
             prev_tab: Tab::Nook,
             tab_fade: 1.0,
+            cat_t: 0.0,
+            cat_born: 0.0,
+            win_pad: 0.0,
         }
     }
 
     fn add_path(&mut self, ctx: &egui::Context, path: PathBuf) {
-        if self.tray.iter().any(|i| i.path == path) {
+        // Ignore our own copies (e.g. a tile dragged out and dropped back onto the notch).
+        if path.starts_with(tray_root()) || self.tray.iter().any(|i| i.path == path) {
             return;
         }
         let meta = std::fs::metadata(&path).ok();
@@ -211,6 +234,23 @@ impl Notch {
                 }
             });
         }
+        // Keep our own copy, so the tray survives the original moving/changing and
+        // dragging a tile out pastes that copy at the drop location.
+        self.tray_seq += 1;
+        let dir = tray_root().join(format!("{}-{}", std::process::id(), self.tray_seq));
+        let stored = dir.join(&name);
+        let state = Arc::new(AtomicU8::new(0));
+        {
+            let (src, dst, st, ctx2) = (path.clone(), stored.clone(), state.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let ok = dst
+                    .parent()
+                    .map_or(false, |d| std::fs::create_dir_all(d).is_ok())
+                    && copy_recursive(&src, &dst).is_ok();
+                st.store(if ok { 1 } else { 2 }, Ordering::Release);
+                ctx2.request_repaint();
+            });
+        }
         self.tray.push(TrayItem {
             path,
             name,
@@ -218,6 +258,8 @@ impl Notch {
             info,
             kind,
             tex: None,
+            stored,
+            state,
         });
     }
 
@@ -307,6 +349,98 @@ fn notch_outline(r: Rect, rad: f32, inset: f32) -> Vec<Pos2> {
     pts
 }
 
+/// Cat-head silhouette (ears up, dip between them) fitted to `r`, as a closed polygon.
+/// Smooth Catmull-Rom curve through hand-placed control points.
+fn cat_outline(r: Rect) -> Vec<Pos2> {
+    const CP: [(f32, f32); 14] = [
+        (0.17, 0.03),
+        (0.33, 0.17),
+        (0.50, 0.26),
+        (0.67, 0.17),
+        (0.83, 0.03),
+        (0.955, 0.22),
+        (1.0, 0.55),
+        (0.95, 0.85),
+        (0.76, 0.97),
+        (0.50, 1.0),
+        (0.24, 0.97),
+        (0.05, 0.85),
+        (0.0, 0.55),
+        (0.045, 0.22),
+    ];
+    const STEPS: usize = 10;
+    let n = CP.len();
+    let mut raw: Vec<(f32, f32)> = Vec::with_capacity(n * STEPS);
+    for i in 0..n {
+        let (p0, p1, p2, p3) = (CP[(i + n - 1) % n], CP[i], CP[(i + 1) % n], CP[(i + 2) % n]);
+        for s in 0..STEPS {
+            let t = s as f32 / STEPS as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            let f = |a: f32, b: f32, c: f32, d: f32| {
+                0.5 * (2.0 * b
+                    + (-a + c) * t
+                    + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
+                    + (-a + 3.0 * b - 3.0 * c + d) * t3)
+            };
+            raw.push((f(p0.0, p1.0, p2.0, p3.0), f(p0.1, p1.1, p2.1, p3.1)));
+        }
+    }
+    // Normalise to the bounding box so the ear tips touch the top edge exactly.
+    let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+    for &(x, y) in &raw {
+        x0 = x0.min(x);
+        x1 = x1.max(x);
+        y0 = y0.min(y);
+        y1 = y1.max(y);
+    }
+    raw.iter()
+        .map(|&(x, y)| {
+            Pos2::new(
+                r.left() + (x - x0) / (x1 - x0) * r.width(),
+                r.top() + (y - y0) / (y1 - y0) * r.height(),
+            )
+        })
+        .collect()
+}
+
+/// Hue (0..1, wraps), saturation, value -> sRGB bytes.
+fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h6 = h.rem_euclid(1.0) * 6.0;
+    let i = h6.floor();
+    let f = h6 - i;
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+    let (r, g, b) = match i as i32 % 6 {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+fn ellipse_pts(c: Pos2, rx: f32, ry: f32) -> Vec<Pos2> {
+    const N: usize = 24;
+    (0..N)
+        .map(|i| {
+            let a = i as f32 / N as f32 * std::f32::consts::TAU;
+            Pos2::new(c.x + rx * a.cos(), c.y + ry * a.sin())
+        })
+        .collect()
+}
+
+/// Where the cat is looking, -1 (left) .. 1 (right): glances somewhere new every ~2.7 s.
+fn cat_gaze(time: f32) -> f32 {
+    const PERIOD: f32 = 2.7;
+    let hash = |n: f32| ((n * 12.9898).sin() * 43758.547).fract().abs() * 2.0 - 1.0;
+    let k = (time / PERIOD).floor();
+    let f = time / PERIOD - k;
+    let e = (f / 0.12).min(1.0);
+    let e = e * e * (3.0 - 2.0 * e);
+    lerp(hash(k - 1.0), hash(k), e)
+}
+
 const DEFAULT_OFFSET_MS: i64 = 500;
 
 fn offset_file() -> Option<PathBuf> {
@@ -355,6 +489,166 @@ fn fmt_time(ms: u64) -> String {
     let s = ms / 1000;
     format!("{}:{:02}", s / 60, s % 60)
 }
+
+/// Where the tray keeps its copies of added files.
+fn tray_root() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("winnotch")
+        .join("tray")
+}
+
+fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for e in std::fs::read_dir(src)? {
+            let e = e?;
+            copy_recursive(&e.path(), &dst.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+/// Deletes a tile's stored copy in the background (only ever inside `tray_root()`).
+fn discard_stored(item: &TrayItem) {
+    if let Some(dir) = item.stored.parent() {
+        let dir = dir.to_path_buf();
+        if dir.starts_with(tray_root()) {
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(dir);
+            });
+        }
+    }
+}
+
+/// The file a tile stands for: our copy once it's ready, otherwise the original.
+fn item_path(item: &TrayItem) -> PathBuf {
+    if item.state.load(Ordering::Acquire) == 1 {
+        item.stored.clone()
+    } else {
+        item.path.clone()
+    }
+}
+
+/// Starts a real OS drag of a tile's file; the drop target (Explorer, desktop, an app)
+/// receives a *copy* of it. Blocks until the drag ends.
+fn drag_out(item: &TrayItem) {
+    if item.state.load(Ordering::Acquire) == 0 {
+        drag_log("skipped: still copying");
+        return;
+    }
+    let path = item_path(item);
+    if path.exists() {
+        start_file_drag(&path);
+    } else {
+        drag_log(&format!("skipped: missing {}", path.display()));
+    }
+}
+
+/// Debug trail for drag-out (`%LOCALAPPDATA%\\winnotch\\drag.log`).
+fn drag_log(msg: &str) {
+    use std::io::Write;
+    if let Some(f) = tray_root().parent().map(|p| p.join("drag.log")) {
+        if let Ok(mut h) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            let _ = writeln!(h, "{}  {}", Local::now().format("%H:%M:%S"), msg);
+        }
+    }
+}
+
+#[cfg(windows)]
+mod ole_drag {
+    use windows::core::{implement, HRESULT};
+    use windows::Win32::Foundation::{
+        BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, S_OK,
+    };
+    use windows::Win32::System::Ole::{IDropSource, IDropSource_Impl, DROPEFFECT};
+    use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
+
+    /// Minimal drag source: drop when the left button is released, cancel on Esc.
+    #[implement(IDropSource)]
+    pub struct DragSource;
+
+    impl IDropSource_Impl for DragSource_Impl {
+        fn QueryContinueDrag(
+            &self,
+            fescapepressed: BOOL,
+            grfkeystate: MODIFIERKEYS_FLAGS,
+        ) -> HRESULT {
+            if fescapepressed.as_bool() {
+                DRAGDROP_S_CANCEL
+            } else if (grfkeystate & MK_LBUTTON) == MODIFIERKEYS_FLAGS(0) {
+                DRAGDROP_S_DROP
+            } else {
+                S_OK
+            }
+        }
+
+        fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
+            DRAGDROP_S_USEDEFAULTCURSORS
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_file_drag(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx, IDataObject};
+    use windows::Win32::System::Ole::{DoDragDrop, IDropSource, OleInitialize, DROPEFFECT, DROPEFFECT_COPY};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{SHCreateDataObject, SHParseDisplayName};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_LBUTTONUP};
+
+    drag_log(&format!("drag start: {}", path.display()));
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        // Harmless if the window toolkit already initialised OLE on this thread.
+        let _ = OleInitialize(None);
+
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        if let Err(e) =
+            SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None)
+        {
+            drag_log(&format!("SHParseDisplayName failed: {e}"));
+            return;
+        }
+        if pidl.is_null() {
+            drag_log("SHParseDisplayName gave a null pidl");
+            return;
+        }
+        let data: windows::core::Result<IDataObject> =
+            SHCreateDataObject(None, Some(&[pidl as *const ITEMIDLIST]), None::<&IDataObject>);
+        match data {
+            Ok(data) => {
+                let src: IDropSource = ole_drag::DragSource.into();
+                let mut effect = DROPEFFECT(0);
+                // COPY only, so the drop pastes a copy and our stored file stays in the tray.
+                let hr = DoDragDrop(&data, &src, DROPEFFECT_COPY, &mut effect);
+                drag_log(&format!("DoDragDrop -> {:?}, effect {}", hr, effect.0));
+            }
+            Err(e) => drag_log(&format!("SHCreateDataObject failed: {e}")),
+        }
+        CoTaskMemFree(Some(pidl as *const std::ffi::c_void));
+        // The drag loop swallowed the mouse-up; tell our window the button was released.
+        if let Ok(hwnd) = FindWindowW(PCWSTR::null(), w!("winnotch")) {
+            let _ = PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn start_file_drag(_path: &Path) {}
 
 fn open_path(p: &Path) {
     #[cfg(windows)]
@@ -840,7 +1134,7 @@ impl Notch {
         now: &DateTime<Local>,
         time: f32,
     ) {
-        let a = ((0.5 - self.t) * 2.0 * 255.0) as u8;
+        let a = ((0.5 - self.t) * 2.0 * (1.0 - self.cat_t) * 255.0) as u8;
         let cy = rect.center().y;
         if let Some(tex) = &self.art_tex {
             let s = 22.0;
@@ -888,6 +1182,78 @@ impl Notch {
                 FontId::proportional(13.0),
                 Color32::from_white_alpha(a),
             );
+        }
+    }
+
+    /// Idle cat notch: purple-glowing cat-head silhouette with eyes that fade in,
+    /// glance around and blink. `a` = overall opacity.
+    fn draw_cat(&self, p: &Painter, rect: Rect, a: f32, time: f32) {
+        let pts = cat_outline(rect);
+
+        // Soft purple glow (stacked translucent strokes), gently breathing.
+        let breathe = 0.82 + 0.18 * (time * 1.6).sin();
+        for (w, al) in [(18.0_f32, 6.0_f32), (13.0, 10.0), (9.0, 17.0), (6.0, 27.0), (3.5, 42.0)] {
+            let c = Color32::from_rgba_unmultiplied(124, 84, 255, (al * a * breathe) as u8);
+            p.add(egui::Shape::closed_line(pts.clone(), Stroke::new(w, c)));
+        }
+
+        // Body: the outline is concave (dip between the ears), so fill it as a
+        // triangle fan from a point inside it instead of a convex polygon.
+        let body = Color32::BLACK.gamma_multiply(a);
+        let centre = Pos2::new(rect.center().x, rect.top() + rect.height() * 0.6);
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(centre, body);
+        for pt in &pts {
+            mesh.colored_vertex(*pt, body);
+        }
+        let n = pts.len() as u32;
+        for i in 0..n {
+            mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+        }
+        p.add(egui::Shape::mesh(mesh));
+
+        // Thin bluish rim light.
+        p.add(egui::Shape::closed_line(
+            pts,
+            Stroke::new(
+                1.3_f32,
+                Color32::from_rgba_unmultiplied(120, 150, 255, (150.0 * a) as u8),
+            ),
+        ));
+
+        // Eyes: fade in a moment after the cat appears, then look around + blink.
+        let appear = ((time - self.cat_born - 0.8) / 0.6).clamp(0.0, 1.0);
+        let ea = appear * appear * (3.0 - 2.0 * appear) * a;
+        if ea > 0.01 {
+            let (w, h) = (rect.width(), rect.height());
+            let gx = cat_gaze(time);
+            let gy = cat_gaze(time + 37.0) * 0.5;
+            let bp = (time + 1.3) % 4.6;
+            let blink = if bp < 0.16 {
+                (bp / 0.16 * std::f32::consts::PI).sin()
+            } else {
+                0.0
+            };
+            let rx = 0.053 * w;
+            let ry = (0.108 * h * (1.0 - 0.9 * blink)).max(0.6);
+            for ex in [0.37_f32, 0.63] {
+                let c = Pos2::new(
+                    rect.left() + ex * w + gx * 0.028 * w,
+                    rect.top() + 0.62 * h + gy * 0.03 * h,
+                );
+                for (k, al) in [(1.8_f32, 14.0_f32), (1.45, 30.0), (1.2, 60.0)] {
+                    p.add(egui::Shape::convex_polygon(
+                        ellipse_pts(c, rx * k, (ry * k).max(0.6)),
+                        Color32::from_rgba_unmultiplied(190, 210, 255, (al * ea) as u8),
+                        Stroke::NONE,
+                    ));
+                }
+                p.add(egui::Shape::convex_polygon(
+                    ellipse_pts(c, rx, ry),
+                    Color32::from_rgba_unmultiplied(238, 240, 190, (255.0 * ea) as u8),
+                    Stroke::NONE,
+                ));
+            }
         }
     }
 
@@ -1040,7 +1406,9 @@ impl Notch {
                         Vec2::new(62.0, 28.0),
                     );
                     if pill(ui, p, look, "clear_tray", clr_r, "Clear", false) {
-                        self.tray.clear();
+                        for it in self.tray.drain(..) {
+                            discard_stored(&it);
+                        }
                         self.tray_page = 0;
                     }
                 }
@@ -1975,11 +2343,12 @@ impl Notch {
 
         let mut remove: Option<usize> = None;
         let mut open: Option<usize> = None;
+        let mut drag: Option<usize> = None;
         for (slot, idx) in (start..end).enumerate() {
             let x = ox + 48.0 + slot as f32 * (92.0 + 11.0);
             let tile = Rect::from_min_size(Pos2::new(x, top + 54.0), Vec2::new(92.0, 108.0));
             let hov_now = ui.rect_contains_pointer(tile);
-            let resp = ui.interact(tile, egui::Id::new(("tile", idx)), Sense::click());
+            let resp = ui.interact(tile, egui::Id::new(("tile", idx)), Sense::click_and_drag());
             let hov = ease_out(ui.ctx().animate_bool_with_time(
                 egui::Id::new(("tile_hov", idx)),
                 hov_now,
@@ -1999,6 +2368,11 @@ impl Notch {
                 );
             }
             let item = &self.tray[idx];
+            let info: &str = if item.state.load(Ordering::Acquire) == 0 {
+                "Copying…"
+            } else {
+                &item.info
+            };
             draw_file_icon(p, look, item, Pos2::new(tile.center().x, tile.top() + 34.0));
             text_centered(
                 p,
@@ -2013,7 +2387,7 @@ impl Notch {
                 p,
                 tile.center().x,
                 tile.top() + 84.0,
-                &item.info,
+                info,
                 11.0,
                 look.dim,
                 84.0,
@@ -2050,17 +2424,24 @@ impl Notch {
                 );
             }
 
-            if xresp.clicked() || resp.secondary_clicked() {
+            if resp.drag_started() && !xresp.hovered() {
+                drag = Some(idx);
+            } else if xresp.clicked() || resp.secondary_clicked() {
                 remove = Some(idx);
             } else if resp.clicked() {
                 open = Some(idx);
             }
         }
         if let Some(i) = open {
-            open_path(&self.tray[i].path);
+            open_path(&item_path(&self.tray[i]));
         }
         if let Some(i) = remove {
-            self.tray.remove(i);
+            let it = self.tray.remove(i);
+            discard_stored(&it);
+        }
+        if let Some(i) = drag {
+            // Blocks for the duration of the OS drag; the drop pastes a copy of the file.
+            drag_out(&self.tray[i]);
         }
 
         // ---- paging arrows + dots ----
@@ -2166,9 +2547,14 @@ impl eframe::App for Notch {
         if dragging_files {
             self.tab = Tab::Tray;
         }
-        let hovered = ctx.input(|i| i.pointer.hover_pos().is_some())
-            || dragging_files
-            || drag_in_hotzone(ctx);
+        // The cat's glow margin is transparent: only the cat itself counts as hover.
+        let pad = self.win_pad;
+        let pointer_in_body = ctx.input(|i| i.pointer.hover_pos()).map_or(false, |pp| {
+            let sr = ctx.screen_rect();
+            Rect::from_min_max(sr.min + Vec2::new(pad, 0.0), sr.max - Vec2::new(pad, pad))
+                .contains(pp)
+        });
+        let hovered = pointer_in_body || dragging_files || drag_in_hotzone(ctx);
         let target = if hovered { 1.0 } else { 0.0 };
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
         self.dt = dt;
@@ -2189,6 +2575,17 @@ impl eframe::App for Notch {
             });
         }
 
+        // --- idle cat face: only while no music is playing ----------------
+        let cat_target = if !np.playing && !self.focus.running { 1.0 } else { 0.0 };
+        if cat_target > 0.5 && self.cat_t < 0.02 {
+            self.cat_born = ctx.input(|i| i.time) as f32;
+        }
+        self.cat_t += (cat_target - self.cat_t) * (1.0 - (-9.0 * dt).exp());
+        if (self.cat_t - cat_target).abs() < 0.004 {
+            self.cat_t = cat_target;
+        }
+        let cat_moving = self.cat_t != cat_target;
+
         // --- lyrics: prefetch, cross-fade and smooth scrolling ----------
         if self.show_lyrics {
             self.lyrics_status = self.media.lyrics_for(&np);
@@ -2203,19 +2600,28 @@ impl eframe::App for Notch {
         if let LyricsStatus::Found(l) = &self.lyrics_status {
             let ptr = Arc::as_ptr(l) as usize;
             let pos = (np.live_pos_ms() as i64 + self.lyric_offset_ms).max(0) as u64;
-            let target = l
-                .current_index(pos, np.dur_ms)
-                .max(if l.synced { -1 } else { 0 }) as f32;
+            // Synced: the scroll position is a pure function of the playback clock
+            // (the line change completes exactly at its timestamp), so there is no
+            // easing lag. Unsynced estimates and seeks still ease.
+            let target = if l.synced {
+                l.scroll_pos(pos)
+            } else {
+                l.current_index(pos, np.dur_ms).max(0) as f32
+            };
             if ptr != self.lyric_ptr || (target - self.lyric_pos).abs() > 6.0 {
                 self.lyric_ptr = ptr;
                 self.lyric_pos = target;
+            } else if l.synced && (target - self.lyric_pos).abs() < 1.5 {
+                self.lyric_pos = target;
             } else {
-                self.lyric_pos += (target - self.lyric_pos) * (1.0 - (-11.0 * dt).exp());
+                let rate = if l.synced { 16.0 } else { 11.0 };
+                self.lyric_pos += (target - self.lyric_pos) * (1.0 - (-rate * dt).exp());
                 if (target - self.lyric_pos).abs() < 0.002 {
                     self.lyric_pos = target;
                 }
             }
-            lyr_moving |= self.show_lyrics && self.lyric_pos != target;
+            lyr_moving |= self.show_lyrics
+                && (self.lyric_pos != target || (l.synced && target.fract() != 0.0));
         }
 
         // --- system events, timers, reminders -> toasts ---------------------
@@ -2287,14 +2693,23 @@ impl eframe::App for Notch {
         }
 
         // --- resize + recenter the OS window to follow the animation ----
-        let base = Vec2::new(
-            lerp(COMPACT.x, TOAST.x, self.toast_t),
-            lerp(COMPACT.y, TOAST.y, self.toast_t),
+        let idle = Vec2::new(
+            lerp(COMPACT.x, CAT.x, self.cat_t),
+            lerp(COMPACT.y, CAT.y, self.cat_t),
         );
-        let size = Vec2::new(
+        let base = Vec2::new(
+            lerp(idle.x, TOAST.x, self.toast_t),
+            lerp(idle.y, TOAST.y, self.toast_t),
+        );
+        let shape_size = Vec2::new(
             lerp(base.x, EXPANDED.x, self.t),
             lerp(base.y, EXPANDED.y, self.t),
         );
+        // Transparent margin for the cat's glow (left/right/bottom; the top is flush).
+        let new_pad = GLOW_PAD * self.cat_t * (1.0 - (self.t * 2.0).min(1.0));
+        let size = shape_size + Vec2::new(2.0 * new_pad, new_pad);
+        let draw_pad = self.win_pad; // margin of the window we are actually drawing into
+        self.win_pad = new_pad;
         let monitor_w = ctx
             .input(|i| i.viewport().monitor_size)
             .map(|m| m.x)
@@ -2314,8 +2729,15 @@ impl eframe::App for Notch {
         let time = ctx.input(|i| i.time) as f32;
         let frame = egui::Frame::none().fill(Color32::TRANSPARENT);
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-            let rect = ui.max_rect();
+            let full = ui.max_rect();
+            let rect = Rect::from_min_max(
+                full.min + Vec2::new(draw_pad, 0.0),
+                full.max - Vec2::new(draw_pad, draw_pad),
+            );
             let p = ui.painter().clone();
+            // Cat face replaces the plain notch while idle; fades out when hovered / toasting.
+            let cat_a = self.cat_t * (1.0 - (self.t * 3.0).min(1.0)) * (1.0 - self.toast_t);
+            let rect_a = 1.0 - cat_a;
             // Flat top (flush with the screen edge), round bottom corners.
             p.rect_filled(
                 rect,
@@ -2325,15 +2747,18 @@ impl eframe::App for Notch {
                     sw: r,
                     se: r,
                 },
-                Color32::BLACK,
+                Color32::BLACK.gamma_multiply(rect_a),
             );
             // Bold outline (no top edge). Brightens as the island opens / a toast shows.
             let glow = ease_out(self.t.max(self.toast_t * 0.7));
             let border = Color32::from_gray(lerp(BORDER_REST as f32, BORDER_ACTIVE as f32, glow) as u8);
             p.add(egui::Shape::line(
                 notch_outline(rect, r, BORDER_W / 2.0),
-                Stroke::new(BORDER_W, border),
+                Stroke::new(BORDER_W, border.gamma_multiply(rect_a)),
             ));
+            if cat_a > 0.01 {
+                self.draw_cat(&p, rect, cat_a, time);
+            }
 
             if self.t < 0.5 {
                 if self.toast_t > 0.02 {
@@ -2362,9 +2787,16 @@ impl eframe::App for Notch {
 
         // Keep ticking: every frame while animating/hovered, ~30fps when the
         // equalizer bars are moving, otherwise ~10x/sec.
-        if animating || hovered || lyr_moving || self.tab_fade != 1.0 || self.toast.is_some() {
+        if animating
+            || hovered
+            || lyr_moving
+            || cat_moving
+            || self.tab_fade != 1.0
+            || self.toast.is_some()
+        {
             ctx.request_repaint();
-        } else if np.playing {
+        } else if np.playing || self.cat_t > 0.0 {
+            // equalizer bars / cat eyes
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
