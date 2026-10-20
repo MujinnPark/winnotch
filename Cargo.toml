@@ -1,0 +1,36 @@
+[package]
+name = "winnotch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+chrono = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", default-features = false }
+windows = { version = "0.58", features = [
+    "Media_Control",
+    "Foundation",
+    "Foundation_Collections",
+    "Networking_Connectivity",
+    "Storage_Streams",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Power",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
