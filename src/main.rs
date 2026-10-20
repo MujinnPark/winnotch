@@ -34,6 +34,10 @@ const EXPANDED_RADIUS: f32 = 32.0;
 const BLUE: Color32 = Color32::from_rgb(10, 132, 255);
 const RED: Color32 = Color32::from_rgb(255, 69, 58);
 const TILES_PER_PAGE: usize = 5;
+/// Bold outline around the island: thickness and resting / active colours.
+const BORDER_W: f32 = 2.0;
+const BORDER_REST: u8 = 58;
+const BORDER_ACTIVE: u8 = 96;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -115,6 +119,14 @@ struct Notch {
     picked: Arc<Mutex<Vec<PathBuf>>>,
     /// Decoded image thumbnails waiting to become textures (filled from helper threads).
     thumbs: Arc<Mutex<Vec<(PathBuf, ColorImage)>>>,
+    /// Last frame's (clamped) delta time, for animations driven from draw code.
+    dt: f32,
+    /// Sliding tab-selector pill: current x offset / width (eased toward the active tab).
+    tab_x: f32,
+    tab_w: f32,
+    /// Tab whose content is currently shown, and its 0..1 fade/slide-in progress.
+    prev_tab: Tab,
+    tab_fade: f32,
 }
 
 impl Notch {
@@ -142,6 +154,11 @@ impl Notch {
             art_id: u64::MAX,
             picked: Default::default(),
             thumbs: Default::default(),
+            dt: 0.016,
+            tab_x: 14.0,
+            tab_w: 56.0,
+            prev_tab: Tab::Nook,
+            tab_fade: 1.0,
         }
     }
 
@@ -231,6 +248,63 @@ impl Notch {
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+/// Cubic ease-out: fast start, soft landing. Input/output 0..1.
+fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Component-wise blend of two (premultiplied) colours.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        f(a.r(), b.r()),
+        f(a.g(), b.g()),
+        f(a.b(), b.b()),
+        f(a.a(), b.a()),
+    )
+}
+
+/// Hover / press progress (0..1, eased) for an interactive area.
+fn hover_press(ui: &egui::Ui, id: egui::Id, resp: &egui::Response) -> (f32, f32) {
+    let ctx = ui.ctx();
+    let hov = ctx.animate_bool_with_time(id.with("hov"), resp.hovered(), 0.12);
+    let press = ctx.animate_bool_with_time(
+        id.with("press"),
+        resp.is_pointer_button_down_on(),
+        0.07,
+    );
+    (ease_out(hov), ease_out(press))
+}
+
+/// The island's outline without the top edge (it sits flush with the screen edge).
+/// `inset` pulls the line inside the rect so the stroke is never clipped by the window.
+fn notch_outline(r: Rect, rad: f32, inset: f32) -> Vec<Pos2> {
+    let (left, right) = (r.left() + inset, r.right() - inset);
+    let (top, bottom) = (r.top(), r.bottom() - inset);
+    let rad = (rad - inset)
+        .min((bottom - top) / 2.0)
+        .min((right - left) / 2.0)
+        .max(0.5);
+    let pi = std::f32::consts::PI;
+    let mut pts = vec![Pos2::new(left, top)];
+    pts.extend(arc_points(
+        Pos2::new(left + rad, bottom - rad),
+        rad,
+        pi,
+        pi / 2.0,
+    ));
+    pts.extend(arc_points(
+        Pos2::new(right - rad, bottom - rad),
+        rad,
+        pi / 2.0,
+        0.0,
+    ));
+    pts.push(Pos2::new(right, top));
+    pts
 }
 
 const DEFAULT_OFFSET_MS: i64 = 500;
@@ -381,17 +455,23 @@ fn rounded_path(r: Rect, rad: f32) -> Vec<Pos2> {
 /// Clickable glyph button; returns true if clicked.
 fn icon_btn(ui: &egui::Ui, id: &str, center: Pos2, glyph: &str, size: f32, color: Color32) -> bool {
     let r = Rect::from_center_size(center, Vec2::splat(size + 14.0));
-    let resp = ui.interact(r, egui::Id::new(id), Sense::click());
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(r, Rounding::same(8.0), Color32::from_white_alpha(18));
+    let id = egui::Id::new(id);
+    let resp = ui.interact(r, id, Sense::click());
+    let (hov, press) = hover_press(ui, id, &resp);
+    let bg_a = 18.0 * hov + 16.0 * press;
+    if bg_a > 0.5 {
+        ui.painter().rect_filled(
+            r.shrink(3.0 * press),
+            Rounding::same(8.0 + 4.0 * press),
+            Color32::from_white_alpha(bg_a as u8),
+        );
     }
     ui.painter().text(
         center,
         Align2::CENTER_CENTER,
         glyph,
         FontId::proportional(size),
-        color,
+        color.gamma_multiply(1.0 - 0.3 * press),
     );
     resp.clicked()
 }
@@ -626,16 +706,21 @@ fn pill(
     label: &str,
     active: bool,
 ) -> bool {
-    let resp = ui.interact(r, egui::Id::new(id), Sense::click());
-    let base: u8 = if active { 72 } else { 44 };
-    let g = if resp.hovered() { base + 16 } else { base };
-    p.rect_filled(r, Rounding::same(14.0), look.fade(Color32::from_gray(g)));
+    let id = egui::Id::new(id);
+    let resp = ui.interact(r, id, Sense::click());
+    let (hov, press) = hover_press(ui, id, &resp);
+    // `active` cross-fades instead of snapping.
+    let act = ui.ctx().animate_bool_with_time(id.with("act"), active, 0.18);
+    let g = lerp(44.0, 72.0, act) + 16.0 * hov + 12.0 * press;
+    // Pressed buttons sink in slightly.
+    let rr = r.shrink(1.6 * press);
+    p.rect_filled(rr, Rounding::same(14.0), look.fade(Color32::from_gray(g as u8)));
     p.text(
-        r.center(),
+        rr.center(),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(13.0),
-        if active { look.white } else { look.grey },
+        mix(look.grey, look.white, act.max(hov * 0.6)),
     );
     resp.clicked()
 }
@@ -817,28 +902,61 @@ impl Notch {
     ) {
         let (ox, top) = (look.ox, look.top);
 
-        for (label, tab, x, w) in [
-            ("Nook", Tab::Nook, 14.0, 56.0),
+        let tabs = [
+            ("Nook", Tab::Nook, 14.0_f32, 56.0_f32),
             ("Tray", Tab::Tray, 74.0, 52.0),
             ("Focus", Tab::Focus, 130.0, 58.0),
             ("Water", Tab::Water, 192.0, 58.0),
             ("To-do", Tab::Todo, 254.0, 58.0),
-        ] {
+        ];
+
+        // Selector pill glides to the active tab.
+        if let Some(&(_, _, tx, tw)) = tabs.iter().find(|t| t.1 == self.tab) {
+            let k = 1.0 - (-22.0 * self.dt).exp();
+            self.tab_x += (tx - self.tab_x) * k;
+            self.tab_w += (tw - self.tab_w) * k;
+            if (tx - self.tab_x).abs() < 0.05 {
+                self.tab_x = tx;
+            }
+            if (tw - self.tab_w).abs() < 0.05 {
+                self.tab_w = tw;
+            }
+        }
+        p.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(ox + self.tab_x, top + 10.0),
+                Vec2::new(self.tab_w, 28.0),
+            ),
+            Rounding::same(14.0),
+            look.fade(Color32::from_gray(48)),
+        );
+
+        for (label, tab, x, w) in tabs {
             let tr = Rect::from_min_size(Pos2::new(ox + x, top + 10.0), Vec2::new(w, 28.0));
-            let resp = ui.interact(tr, egui::Id::new(("tab", label)), Sense::click());
+            let id = egui::Id::new(("tab", label));
+            let resp = ui.interact(tr, id, Sense::click());
             if resp.clicked() {
                 self.tab = tab;
             }
-            let sel = self.tab == tab;
-            if sel {
-                p.rect_filled(tr, Rounding::same(14.0), look.fade(Color32::from_gray(48)));
+            let (hov, press) = hover_press(ui, id, &resp);
+            let sel = ui
+                .ctx()
+                .animate_bool_with_time(id.with("sel"), self.tab == tab, 0.15);
+            // Soft hover highlight on tabs that aren't selected.
+            let h = hov * (1.0 - sel);
+            if h > 0.01 {
+                p.rect_filled(
+                    tr,
+                    Rounding::same(14.0),
+                    look.fade(Color32::from_gray(30)).gamma_multiply(h),
+                );
             }
             p.text(
-                tr.center(),
+                tr.center() + Vec2::new(0.0, 0.6 * press),
                 Align2::CENTER_CENTER,
                 label,
                 FontId::proportional(13.0),
-                if sel { look.white } else { look.grey },
+                mix(look.grey, look.white, sel.max(hov * 0.5)).gamma_multiply(1.0 - 0.25 * press),
             );
         }
 
@@ -1483,7 +1601,9 @@ impl Notch {
             &arc_points(c, r, 0.0, std::f32::consts::TAU),
             Stroke::new(6.0_f32, look.fade(Color32::from_gray(40))),
         );
-        let f = self.water.fraction();
+        let f = ui
+            .ctx()
+            .animate_value_with_time(egui::Id::new("water_ring"), self.water.fraction(), 0.4);
         if f > 0.002 {
             let a0 = -std::f32::consts::FRAC_PI_2;
             polyline(
@@ -1659,21 +1779,34 @@ impl Notch {
             let cy = top + 64.0 + row as f32 * 28.0;
             let chk = Rect::from_center_size(Pos2::new(ox + 34.0, cy), Vec2::splat(22.0));
             let resp = ui.interact(chk, egui::Id::new(("todo_chk", i)), Sense::click());
-            let ring = if t.done { look.fade(GREEN) } else { look.grey };
-            p.circle_stroke(chk.center(), 8.0, Stroke::new(1.6_f32, ring));
-            if t.done {
-                p.circle_filled(chk.center(), 5.0, look.fade(GREEN));
+            let (chk_hov, chk_press) =
+                hover_press(ui, egui::Id::new(("todo_chk", i)), &resp);
+            // 0 -> 1 when the task gets completed: ring turns green, dot pops in,
+            // strike-through draws itself across the text.
+            let da = ease_out(ui.ctx().animate_bool_with_time(
+                egui::Id::new(("todo_done_anim", i)),
+                t.done,
+                0.22,
+            ));
+            let ring = mix(look.grey, look.fade(GREEN), da);
+            p.circle_stroke(
+                chk.center(),
+                8.0 + 0.9 * chk_hov - 1.2 * chk_press,
+                Stroke::new(1.6_f32, ring),
+            );
+            if da > 0.01 {
+                p.circle_filled(chk.center(), 5.0 * da, look.fade(GREEN));
             }
             if resp.clicked() {
                 toggle = Some(i);
             }
-            let col = if t.done { look.dim } else { look.white };
+            let col = mix(look.white, look.dim, da);
             let g = layout(p, &t.text, 14.0, col, 400.0, 1);
             let w = g.size().x;
             p.galley(Pos2::new(ox + 54.0, cy - g.size().y / 2.0), g, col);
-            if t.done {
+            if da > 0.01 {
                 p.line_segment(
-                    [Pos2::new(ox + 54.0, cy), Pos2::new(ox + 54.0 + w, cy)],
+                    [Pos2::new(ox + 54.0, cy), Pos2::new(ox + 54.0 + w * da, cy)],
                     Stroke::new(1.2_f32, look.dim),
                 );
             }
@@ -1700,12 +1833,14 @@ impl Notch {
             }
             let xr = Rect::from_center_size(Pos2::new(ox + 566.0, cy), Vec2::splat(22.0));
             let resp = ui.interact(xr, egui::Id::new(("todo_del", i)), Sense::click());
+            let (del_hov, del_press) =
+                hover_press(ui, egui::Id::new(("todo_del", i)), &resp);
             p.text(
                 xr.center(),
                 Align2::CENTER_CENTER,
                 "×",
                 FontId::proportional(16.0),
-                if resp.hovered() { look.white } else { look.dim },
+                mix(look.dim, look.white, del_hov).gamma_multiply(1.0 - 0.3 * del_press),
             );
             if resp.clicked() {
                 remove = Some(i);
@@ -1843,13 +1978,24 @@ impl Notch {
         for (slot, idx) in (start..end).enumerate() {
             let x = ox + 48.0 + slot as f32 * (92.0 + 11.0);
             let tile = Rect::from_min_size(Pos2::new(x, top + 54.0), Vec2::new(92.0, 108.0));
-            let hov = ui.rect_contains_pointer(tile);
+            let hov_now = ui.rect_contains_pointer(tile);
             let resp = ui.interact(tile, egui::Id::new(("tile", idx)), Sense::click());
-            if hov {
+            let hov = ease_out(ui.ctx().animate_bool_with_time(
+                egui::Id::new(("tile_hov", idx)),
+                hov_now,
+                0.14,
+            ));
+            let tile_press = ease_out(ui.ctx().animate_bool_with_time(
+                egui::Id::new(("tile_press", idx)),
+                resp.is_pointer_button_down_on(),
+                0.07,
+            ));
+            if hov > 0.01 {
                 p.rect_filled(
-                    tile,
+                    tile.shrink(2.0 * tile_press),
                     Rounding::same(12.0),
-                    look.fade(Color32::from_gray(34)),
+                    look.fade(Color32::from_gray(34 + (10.0 * tile_press) as u8))
+                        .gamma_multiply(hov),
                 );
             }
             let item = &self.tray[idx];
@@ -1879,14 +2025,15 @@ impl Notch {
                 Vec2::splat(18.0),
             );
             let xresp = ui.interact(xr, egui::Id::new(("tile_x", idx)), Sense::click());
-            if hov {
+            if hov > 0.01 {
                 let c = xr.center();
                 p.circle_filled(
                     c,
                     8.0,
-                    look.fade(Color32::from_gray(if xresp.hovered() { 96 } else { 66 })),
+                    look.fade(Color32::from_gray(if xresp.hovered() { 96 } else { 66 }))
+                        .gamma_multiply(hov),
                 );
-                let s = Stroke::new(1.5_f32, look.white);
+                let s = Stroke::new(1.5_f32, look.white.gamma_multiply(hov));
                 p.line_segment(
                     [
                         Pos2::new(c.x - 3.0, c.y - 3.0),
@@ -1925,8 +2072,10 @@ impl Notch {
                     (dir < 0 && self.tray_page > 0) || (dir > 0 && self.tray_page + 1 < pages);
                 let r = Rect::from_center_size(c, Vec2::splat(26.0));
                 let resp = ui.interact(r, egui::Id::new(("page", dir)), Sense::click());
-                let g = if resp.hovered() && enabled { 72 } else { 48 };
-                p.circle_filled(c, 11.0, look.fade(Color32::from_gray(g)));
+                let (ph, pp) = hover_press(ui, egui::Id::new(("page", dir)), &resp);
+                let en = if enabled { 1.0 } else { 0.0 };
+                let g = 48.0 + 24.0 * ph * en + 10.0 * pp * en;
+                p.circle_filled(c, 11.0 - 1.5 * pp * en, look.fade(Color32::from_gray(g as u8)));
                 let col = if enabled { look.white } else { look.dim };
                 let d = dir as f32;
                 polyline(
@@ -2022,6 +2171,7 @@ impl eframe::App for Notch {
             || drag_in_hotzone(ctx);
         let target = if hovered { 1.0 } else { 0.0 };
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
+        self.dt = dt;
         let k = 1.0 - (-16.0 * dt).exp();
         self.t += (target - self.t) * k;
         if (self.t - target).abs() < 0.002 {
@@ -2126,6 +2276,16 @@ impl eframe::App for Notch {
             self.toast = None;
         }
 
+        // --- tab content fades/slides in whenever the tab changes ----------
+        if self.tab != self.prev_tab {
+            self.prev_tab = self.tab;
+            self.tab_fade = 0.0;
+        }
+        self.tab_fade += (1.0 - self.tab_fade) * (1.0 - (-16.0 * dt).exp());
+        if 1.0 - self.tab_fade < 0.004 {
+            self.tab_fade = 1.0;
+        }
+
         // --- resize + recenter the OS window to follow the animation ----
         let base = Vec2::new(
             lerp(COMPACT.x, TOAST.x, self.toast_t),
@@ -2167,6 +2327,13 @@ impl eframe::App for Notch {
                 },
                 Color32::BLACK,
             );
+            // Bold outline (no top edge). Brightens as the island opens / a toast shows.
+            let glow = ease_out(self.t.max(self.toast_t * 0.7));
+            let border = Color32::from_gray(lerp(BORDER_REST as f32, BORDER_ACTIVE as f32, glow) as u8);
+            p.add(egui::Shape::line(
+                notch_outline(rect, r, BORDER_W / 2.0),
+                Stroke::new(BORDER_W, border),
+            ));
 
             if self.t < 0.5 {
                 if self.toast_t > 0.02 {
@@ -2180,18 +2347,22 @@ impl eframe::App for Notch {
 
             let look = Look::new(rect, self.t);
             self.draw_header(ctx, ui, &p, &look, &now);
+            // Tab body: fade in and rise ~10px into place after a tab switch.
+            let e = ease_out(self.tab_fade);
+            let mut body = look.scaled(e);
+            body.top += (1.0 - e) * 10.0;
             match self.tab {
-                Tab::Nook => self.draw_nook(ui, &p, &look, &np, &now),
-                Tab::Tray => self.draw_tray(ui, &p, &look, dragging_files),
-                Tab::Focus => self.draw_focus(ui, &p, &look),
-                Tab::Water => self.draw_water(ui, &p, &look),
-                Tab::Todo => self.draw_todo(ui, &p, &look, &now),
+                Tab::Nook => self.draw_nook(ui, &p, &body, &np, &now),
+                Tab::Tray => self.draw_tray(ui, &p, &body, dragging_files),
+                Tab::Focus => self.draw_focus(ui, &p, &body),
+                Tab::Water => self.draw_water(ui, &p, &body),
+                Tab::Todo => self.draw_todo(ui, &p, &body, &now),
             }
         });
 
         // Keep ticking: every frame while animating/hovered, ~30fps when the
         // equalizer bars are moving, otherwise ~10x/sec.
-        if animating || hovered || lyr_moving || self.toast.is_some() {
+        if animating || hovered || lyr_moving || self.tab_fade != 1.0 || self.toast.is_some() {
             ctx.request_repaint();
         } else if np.playing {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
