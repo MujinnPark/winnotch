@@ -583,6 +583,23 @@ mod ole_drag {
             if fescapepressed.as_bool() {
                 DRAGDROP_S_CANCEL
             } else if (grfkeystate & MK_LBUTTON) == MODIFIERKEYS_FLAGS(0) {
+                unsafe {
+                    use windows::Win32::Foundation::POINT;
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        GetClassNameW, GetCursorPos, WindowFromPoint,
+                    };
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    let hwnd = WindowFromPoint(pt);
+                    let mut buf = [0u16; 64];
+                    let n = GetClassNameW(hwnd, &mut buf).max(0) as usize;
+                    super::drag_log(&format!(
+                        "released at ({}, {}) over window class '{}'",
+                        pt.x,
+                        pt.y,
+                        String::from_utf16_lossy(&buf[..n.min(buf.len())])
+                    ));
+                }
                 DRAGDROP_S_DROP
             } else {
                 S_OK
@@ -614,7 +631,7 @@ fn start_file_drag(path: &Path) {
         .collect();
     unsafe {
         // Harmless if the window toolkit already initialised OLE on this thread.
-        let _ = OleInitialize(None);
+        drag_log(&format!("OleInitialize -> {:?}", OleInitialize(None)));
 
         let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
         if let Err(e) =
@@ -2804,7 +2821,37 @@ impl eframe::App for Notch {
     }
 }
 
+/// Registers (or with `--no-autostart`, removes) a per-user Run entry so winnotch starts
+/// with Windows. Re-registers on every launch so it always points at the exe you last ran.
+#[cfg(windows)]
+fn sync_autostart(enable: bool) {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let mut cmd = Command::new("reg");
+    if enable {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        cmd.args(["add", KEY, "/v", "Winnotch", "/t", "REG_SZ", "/d"])
+            .arg(format!("\"{}\"", exe.display()))
+            .arg("/f");
+    } else {
+        cmd.args(["delete", KEY, "/v", "Winnotch", "/f"]);
+    }
+    let _ = cmd
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    {
+        let enable = !std::env::args().any(|a| a == "--no-autostart");
+        std::thread::spawn(move || sync_autostart(enable));
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(COMPACT)
