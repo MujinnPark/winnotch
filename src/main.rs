@@ -1152,16 +1152,30 @@ fn draw_file_icon(p: &Painter, look: &Look, item: &TrayItem, c: Pos2) {
     }
 }
 
-/// True while the left mouse button is held (e.g. dragging a file) and the cursor
-/// is near the top-center of the screen. Lets the notch open *before* the drag
-/// reaches the tiny collapsed window, so there is a drop target to hit.
+/// True while a *drag* is in progress that has reached the top-center of the screen, so the
+/// notch can open *before* the drag arrives at the tiny collapsed window (giving a drop
+/// target to hit). A plain click or press inside that strip (browser tabs, title bars...)
+/// must NOT count, or the island pops open over whatever the user is clicking. So the
+/// press has to have started *outside* the strip and then travelled into it.
 #[cfg(windows)]
 fn drag_in_hotzone(ctx: &egui::Context) -> bool {
+    use std::cell::Cell;
     use windows::Win32::Foundation::POINT;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM_SWAPBUTTON};
+
+    thread_local!(static ORIGIN: Cell<Option<(i32, i32)>> = Cell::new(None));
+
     unsafe {
-        if GetAsyncKeyState(VK_LBUTTON.0 as i32) >= 0 {
+        // GetAsyncKeyState reports *physical* buttons; with swapped buttons (left-handed
+        // setting) the primary one is the physical right button.
+        let primary = if GetSystemMetrics(SM_SWAPBUTTON) != 0 {
+            VK_RBUTTON
+        } else {
+            VK_LBUTTON
+        };
+        if GetAsyncKeyState(primary.0 as i32) >= 0 {
+            ORIGIN.with(|o| o.set(None));
             return false;
         }
         let mut pt = POINT::default();
@@ -1174,7 +1188,22 @@ fn drag_in_hotzone(ctx: &egui::Context) -> bool {
             .map(|m| m.x)
             .unwrap_or(1920.0)
             * ppp;
-        (pt.y as f32) < 70.0 * ppp && ((pt.x as f32) - mw / 2.0).abs() < 300.0 * ppp
+        let in_zone =
+            |x: i32, y: i32| (y as f32) < 70.0 * ppp && ((x as f32) - mw / 2.0).abs() < 300.0 * ppp;
+
+        // Where this press started (first frame we saw the button down).
+        let (ox, oy) = ORIGIN.with(|o| match o.get() {
+            Some(v) => v,
+            None => {
+                o.set(Some((pt.x, pt.y)));
+                (pt.x, pt.y)
+            }
+        });
+        if in_zone(ox, oy) {
+            return false; // pressed inside the strip: a click, not a drag arriving
+        }
+        let moved = (pt.x - ox).abs().max((pt.y - oy).abs()) >= (8.0 * ppp) as i32;
+        moved && in_zone(pt.x, pt.y)
     }
 }
 
@@ -2617,7 +2646,9 @@ impl eframe::App for Notch {
             Rect::from_min_max(sr.min + Vec2::new(pad, 0.0), sr.max - Vec2::new(pad, pad))
                 .contains(pp)
         });
-        let hovered = pointer_in_body || dragging_files || drag_in_hotzone(ctx);
+        // Evaluated every frame (not short-circuited): it tracks where each press started.
+        let drag_near = drag_in_hotzone(ctx);
+        let hovered = pointer_in_body || dragging_files || drag_near;
         let target = if hovered { 1.0 } else { 0.0 };
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
         self.dt = dt;
