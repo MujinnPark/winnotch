@@ -2867,8 +2867,54 @@ impl eframe::App for Notch {
     }
 }
 
+/// Keeps a copy of the running exe at `%LOCALAPPDATA%\Programs\winnotch\winnotch.exe` and
+/// returns its path, so the startup entry never points at a network share, `\\wsl.localhost`,
+/// the Downloads folder or a USB stick (Windows warns about those at every boot, and they
+/// may not even exist yet when you sign in). Returns `None` if the copy couldn't be made.
+#[cfg(windows)]
+fn install_local_copy(current: &Path) -> Option<PathBuf> {
+    use std::fs;
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let dir = PathBuf::from(base).join("Programs").join("winnotch");
+    let target = dir.join("winnotch.exe");
+
+    // Already running from the installed location.
+    if let (Ok(a), Ok(b)) = (current.canonicalize(), target.canonicalize()) {
+        if a == b {
+            return Some(target);
+        }
+    }
+    fs::create_dir_all(&dir).ok()?;
+
+    // Skip the copy if the installed one is already identical (same size + timestamp).
+    if let (Ok(s), Ok(d)) = (fs::metadata(current), fs::metadata(&target)) {
+        if s.len() == d.len() && s.modified().ok() == d.modified().ok() {
+            return Some(target);
+        }
+    }
+
+    // A running exe can't be overwritten but *can* be renamed, so copy beside it, move the
+    // old one aside and slide the new one in. This also lets a newer download update it.
+    let new = dir.join("winnotch.new");
+    let old = dir.join("winnotch.old");
+    fs::copy(current, &new).ok()?;
+    let _ = fs::remove_file(&old);
+    if target.exists() && fs::rename(&target, &old).is_err() {
+        let _ = fs::remove_file(&new);
+        return None;
+    }
+    if fs::rename(&new, &target).is_err() {
+        let _ = fs::rename(&old, &target); // put the previous one back
+        let _ = fs::remove_file(&new);
+        return None;
+    }
+    let _ = fs::remove_file(&old); // fails harmlessly while it is still running
+    Some(target)
+}
+
 /// Registers (or with `--no-autostart`, removes) a per-user Run entry so winnotch starts
-/// with Windows. Re-registers on every launch so it always points at the exe you last ran.
+/// with Windows. Re-registers on every launch, pointing at the local copy made by
+/// `install_local_copy` (or at the running exe if that copy fails).
 #[cfg(windows)]
 fn sync_autostart(enable: bool) {
     use std::os::windows::process::CommandExt;
@@ -2876,9 +2922,10 @@ fn sync_autostart(enable: bool) {
     const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
     let mut cmd = Command::new("reg");
     if enable {
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(current) = std::env::current_exe() else {
             return;
         };
+        let exe = install_local_copy(&current).unwrap_or(current);
         cmd.args(["add", KEY, "/v", "Winnotch", "/t", "REG_SZ", "/d"])
             .arg(format!("\"{}\"", exe.display()))
             .arg("/f");

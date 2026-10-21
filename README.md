@@ -11,7 +11,9 @@ Windows may show a "Windows protected your PC" (SmartScreen) message the first t
 
 ### Starts with Windows
 
-The first time you run it, winnotch adds itself to your startup apps, so it comes back every time you sign in. If you move `winnotch.exe` to another folder, just double-click it once from the new place and the startup entry updates.
+The first time you run it, winnotch copies itself to `%LOCALAPPDATA%\Programs\winnotch\` and adds that copy to your startup apps, so it comes back every time you sign in, without a security prompt. You can run the downloaded exe from anywhere (even Downloads) and delete it afterwards.
+
+To update, download the new `winnotch.exe` and double-click it once; it replaces the installed copy.
 
 ## How to quit
 
@@ -26,7 +28,11 @@ winnotch has no window or close button, so to close it:
 Either:
 
 - Open **Task Manager → Startup apps**, right-click **Winnotch** and choose **Disable**, or
-- Press **Win + R**, run `"C:\path\to\winnotch.exe" --no-autostart` (use the real path), and then end the task as above. This removes the startup entry.
+- Press **Win + R**, run `"%LOCALAPPDATA%\Programs\winnotch\winnotch.exe" --no-autostart`, and then end the task as above. This removes the startup entry.
+
+### Uninstall
+
+End the task, remove it from startup as above, then delete the folder `%LOCALAPPDATA%\Programs\winnotch` (and `%APPDATA%\winnotch` if you also want to erase your saved to-dos and water progress).
 
 ## What it does
 
