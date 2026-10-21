@@ -846,6 +846,47 @@ fn arc_points(c: Pos2, r: f32, a0: f32, a1: f32) -> Vec<Pos2> {
         .collect()
 }
 
+/// Purple glow rising from the bottom edge of the expanded island (same purple as the idle
+/// cat). Built as horizontal slices that follow the rounded bottom corners, with vertex
+/// colours doing the fade: transparent at ~45% height, strongest along the bottom edge,
+/// slightly softer towards the left/right sides.
+fn draw_bottom_glow(p: &Painter, rect: Rect, rad: f32, a: f32) {
+    const ROWS: usize = 28;
+    let y0 = rect.top() + rect.height() * 0.45;
+    let yb = rect.bottom();
+    let rad = rad.min(rect.width() / 2.0).min(yb - y0).max(0.5);
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=ROWS {
+        let k = i as f32 / ROWS as f32;
+        let y = y0 + (yb - y0) * k;
+        let dy = y - (yb - rad);
+        let inset = if dy > 0.0 {
+            rad - (rad * rad - dy * dy).max(0.0).sqrt()
+        } else {
+            0.0
+        };
+        let (l, r) = (rect.left() + inset, rect.right() - inset);
+        let cx = (l + r) / 2.0;
+        let alpha = k.powf(1.8) * 175.0 * a;
+        // deep violet higher up, brighter lilac at the very bottom
+        let (cr, cg, cb) = (lerp(96.0, 150.0, k), lerp(64.0, 100.0, k), lerp(230.0, 255.0, k));
+        let col = |edge: f32| {
+            Color32::from_rgba_unmultiplied(cr as u8, cg as u8, cb as u8, (alpha * edge).clamp(0.0, 255.0) as u8)
+        };
+        mesh.colored_vertex(Pos2::new(l, y), col(0.75));
+        mesh.colored_vertex(Pos2::new(cx, y), col(1.0));
+        mesh.colored_vertex(Pos2::new(r, y), col(0.75));
+    }
+    for i in 0..ROWS as u32 {
+        let (a0, b0) = (i * 3, i * 3 + 3);
+        mesh.add_triangle(a0, a0 + 1, b0 + 1);
+        mesh.add_triangle(a0, b0 + 1, b0);
+        mesh.add_triangle(a0 + 1, a0 + 2, b0 + 2);
+        mesh.add_triangle(a0 + 1, b0 + 2, b0 + 1);
+    }
+    p.add(egui::Shape::mesh(mesh));
+}
+
 /// Small line icon for a toast, centered on `c` (about 20 x 20 px).
 fn draw_icon(p: &Painter, kind: ToastKind, c: Pos2, col: Color32, on: bool) {
     let s = Stroke::new(1.8_f32, col);
@@ -2852,6 +2893,11 @@ impl eframe::App for Notch {
                 },
                 Color32::BLACK.gamma_multiply(rect_a),
             );
+            // Purple glow along the bottom edge once the island opens.
+            let glow_a = ease_out(((self.t - 0.25) / 0.75).clamp(0.0, 1.0)) * rect_a;
+            if glow_a > 0.01 {
+                draw_bottom_glow(&p, rect, r, glow_a);
+            }
             // Outline (no top edge) on the small pill / toast only. It fades away as the
             // island opens, so the expanded island is a clean borderless black shape.
             let open_fade = 1.0 - ease_out((self.t * 2.0).min(1.0));
