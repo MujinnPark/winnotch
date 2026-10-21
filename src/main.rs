@@ -3003,38 +3003,72 @@ fn install_local_copy(current: &Path) -> Option<PathBuf> {
     Some(target)
 }
 
-/// Registers (or with `--no-autostart`, removes) a per-user Run entry so winnotch starts
-/// with Windows. Re-registers on every launch, pointing at the local copy made by
-/// `install_local_copy` (or at the running exe if that copy fails).
+/// Start-with-Windows support, strictly opt-in (nothing persistent happens by default):
+///   `winnotch.exe --autostart`     keep a copy in %LOCALAPPDATA%\Programs\winnotch and add it
+///                                  to the per-user Run key (HKCU, no admin needed)
+///   `winnotch.exe --no-autostart`  remove that Run entry
+/// The simpler alternative, with no flags, is a shortcut in the `shell:startup` folder.
+/// The Run key is written with the registry API directly rather than by spawning `reg.exe`.
 #[cfg(windows)]
 fn sync_autostart(enable: bool) {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    let mut cmd = Command::new("reg");
-    if enable {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::w;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_SET_VALUE, REG_SZ,
+    };
+
+    // Resolve the exe to register before touching the registry.
+    let exe = if enable {
         let Ok(current) = std::env::current_exe() else {
             return;
         };
-        let exe = install_local_copy(&current).unwrap_or(current);
-        cmd.args(["add", KEY, "/v", "Winnotch", "/t", "REG_SZ", "/d"])
-            .arg(format!("\"{}\"", exe.display()))
-            .arg("/f");
+        Some(install_local_copy(&current).unwrap_or(current))
     } else {
-        cmd.args(["delete", KEY, "/v", "Winnotch", "/f"]);
+        None
+    };
+
+    unsafe {
+        let mut key = HKEY::default();
+        let _ = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+            0,
+            KEY_SET_VALUE,
+            &mut key,
+        );
+        if key.is_invalid() {
+            return;
+        }
+        match exe {
+            Some(exe) => {
+                let quoted = format!("\"{}\"", exe.display());
+                let wide: Vec<u16> = std::ffi::OsStr::new(&quoted)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let bytes =
+                    std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
+                let _ = RegSetValueExW(key, w!("Winnotch"), 0, REG_SZ, Some(bytes));
+            }
+            None => {
+                let _ = RegDeleteValueW(key, w!("Winnotch"));
+            }
+        }
+        let _ = RegCloseKey(key);
     }
-    let _ = cmd
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 fn main() -> eframe::Result<()> {
     #[cfg(windows)]
     {
-        let enable = !std::env::args().any(|a| a == "--no-autostart");
-        std::thread::spawn(move || sync_autostart(enable));
+        // Opt-in only: no persistence unless explicitly asked for.
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--no-autostart") {
+            std::thread::spawn(|| sync_autostart(false));
+        } else if args.iter().any(|a| a == "--autostart") {
+            std::thread::spawn(|| sync_autostart(true));
+        }
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
