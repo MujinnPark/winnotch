@@ -35,7 +35,7 @@ const TOAST: Vec2 = Vec2::new(330.0, 46.0);
 const ORANGE: Color32 = Color32::from_rgb(255, 159, 10);
 const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
 const COMPACT_RADIUS: f32 = 14.0;
-const EXPANDED_RADIUS: f32 = 32.0;
+const EXPANDED_RADIUS: f32 = 40.0;
 const BLUE: Color32 = Color32::from_rgb(10, 132, 255);
 const RED: Color32 = Color32::from_rgb(255, 69, 58);
 const TILES_PER_PAGE: usize = 5;
@@ -1380,13 +1380,22 @@ impl Notch {
                 self.tab_w = tw;
             }
         }
+        // Soft capsule behind the whole tab group, with the selector gliding inside it.
+        p.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(ox + 8.0, top + 6.0),
+                Pos2::new(ox + 318.0, top + 42.0),
+            ),
+            Rounding::same(18.0),
+            look.fade(Color32::from_gray(22)),
+        );
         p.rect_filled(
             Rect::from_min_size(
                 Pos2::new(ox + self.tab_x, top + 10.0),
                 Vec2::new(self.tab_w, 28.0),
             ),
             Rounding::same(14.0),
-            look.fade(Color32::from_gray(48)),
+            look.fade(Color32::from_gray(58)),
         );
 
         for (label, tab, x, w) in tabs {
@@ -1406,7 +1415,7 @@ impl Notch {
                 p.rect_filled(
                     tr,
                     Rounding::same(14.0),
-                    look.fade(Color32::from_gray(30)).gamma_multiply(h),
+                    look.fade(Color32::from_gray(38)).gamma_multiply(h),
                 );
             }
             p.text(
@@ -1522,13 +1531,13 @@ impl Notch {
         let art_rect = Rect::from_min_size(Pos2::new(ox + 22.0, top + 50.0), Vec2::splat(84.0));
         if let Some(tex) = &self.art_tex {
             egui::Image::from_texture(SizedTexture::new(tex.id(), Vec2::splat(84.0)))
-                .rounding(12.0)
+                .rounding(16.0)
                 .tint(Color32::from_white_alpha((look.af * 255.0) as u8))
                 .paint_at(ui, art_rect);
         } else {
             p.rect_filled(
                 art_rect,
-                Rounding::same(12.0),
+                Rounding::same(16.0),
                 look.fade(Color32::from_gray(34)),
             );
             p.text(
@@ -2843,13 +2852,18 @@ impl eframe::App for Notch {
                 },
                 Color32::BLACK.gamma_multiply(rect_a),
             );
-            // Bold outline (no top edge). Brightens as the island opens / a toast shows.
-            let glow = ease_out(self.t.max(self.toast_t * 0.7));
-            let border = Color32::from_gray(lerp(BORDER_REST as f32, BORDER_ACTIVE as f32, glow) as u8);
-            p.add(egui::Shape::line(
-                notch_outline(rect, r, BORDER_W / 2.0),
-                Stroke::new(BORDER_W, border.gamma_multiply(rect_a)),
-            ));
+            // Outline (no top edge) on the small pill / toast only. It fades away as the
+            // island opens, so the expanded island is a clean borderless black shape.
+            let open_fade = 1.0 - ease_out((self.t * 2.0).min(1.0));
+            if open_fade > 0.01 {
+                let glow = ease_out(self.toast_t * 0.7);
+                let border =
+                    Color32::from_gray(lerp(BORDER_REST as f32, BORDER_ACTIVE as f32, glow) as u8);
+                p.add(egui::Shape::line(
+                    notch_outline(rect, r, BORDER_W / 2.0),
+                    Stroke::new(BORDER_W, border.gamma_multiply(rect_a * open_fade)),
+                ));
+            }
             if cat_a > 0.01 {
                 self.draw_cat(&p, rect, cat_a, time);
             }
